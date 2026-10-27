@@ -1,0 +1,25 @@
+# Dataset
+dataset/
+physionet.org/
+
+# Ambientes Python
+.venv/
+venv/
+env/
+
+# Ficheiros temporários
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Resultados e modelos treinados
+results/
+checkpoints/
+models/
+*.keras
+*.h5
+
+# Ficheiros locais
+.env
+.DS_Store
+Thumbs.db
