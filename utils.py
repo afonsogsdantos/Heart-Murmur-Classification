@@ -1,9 +1,3 @@
-"""Utilitários de exploração do CirCor DigiScope.
-
-Funções de processamento de áudio, visualização e avaliação reutilizáveis.
-As escolhas experimentais e as análises permanecem no notebook principal.
-"""
-
 from pathlib import Path
 
 import librosa
