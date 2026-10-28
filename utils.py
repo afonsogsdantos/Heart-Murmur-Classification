@@ -332,3 +332,152 @@ def prepare_window_inputs(window, mean, std, feature_kwargs=None):
     features = extract_logmel_window(window, **(feature_kwargs or {}))
     normalized = normalize_logmel(features, mean, std)
     return format_model_inputs(normalized)
+
+
+# --- Funções partilhadas pelo treino e pela avaliação das redes ---
+
+def balanced_window_weights(train_windows):
+    """Pondera as janelas, equilibrando classes, pacientes e gravações.
+
+    Cada classe tem o mesmo peso total; dentro de uma classe, cada paciente
+    contribui de forma igual e cada gravação do paciente tem o mesmo peso.
+    Assim, gravações longas não dominam a função de perda só por criarem
+    um maior número de janelas.
+    """
+    if train_windows.empty:
+        raise ValueError('Não há janelas de treino para ponderar.')
+    required = {'patient_id', 'filename', 'murmur'}
+    if not required.issubset(train_windows.columns):
+        raise ValueError(f'Colunas em falta: {sorted(required - set(train_windows.columns))}')
+    patient_labels = train_windows[['patient_id', 'murmur']].drop_duplicates()
+    if patient_labels['patient_id'].duplicated().any():
+        raise ValueError('Foram encontrados diagnósticos inconsistentes para um paciente.')
+
+    n_patients_class = patient_labels.groupby('murmur')['patient_id'].nunique()
+    n_recordings_patient = (
+        train_windows[['patient_id', 'filename']].drop_duplicates()
+        .groupby('patient_id').size()
+    )
+    n_windows_recording = train_windows.groupby(['patient_id', 'filename'])['filename'].transform('size')
+
+    weights = (
+        1.0 / train_windows['murmur'].map(n_patients_class).to_numpy(dtype='float64')
+        / train_windows['patient_id'].map(n_recordings_patient).to_numpy(dtype='float64')
+        / n_windows_recording.to_numpy(dtype='float64')
+    )
+    if not np.isfinite(weights).all() or (weights <= 0).any():
+        raise ValueError('Não foi possível calcular pesos de treino válidos.')
+    weights /= weights.mean()  # Peso médio igual a 1 para estabilidade da otimização.
+    return weights.astype('float32')
+
+
+def cache_normalized_logmel(windows, mean, std, cache_path, feature_kwargs=None, progress_every=2000):
+    """Guarda log-mel-espectrogramas normalizados em disco, sem os manter em RAM.
+
+    O ficheiro NPY utiliza float16 apenas para reduzir o espaço ocupado em disco;
+    os lotes são convertidos para float32 antes de entrarem nas redes. A assinatura
+    da cache inclui as janelas, os parâmetros de extração e a normalização, para
+    impedir a reutilização acidental de características desatualizadas.
+    """
+    import hashlib
+    import json
+
+    if windows.empty:
+        raise ValueError('Não há janelas para processar.')
+    options = dict(feature_kwargs or {})
+    cache_path = Path(cache_path)
+    if cache_path.suffix != '.npy':
+        raise ValueError('O ficheiro de cache deve ter a extensão .npy.')
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path = cache_path.with_suffix('.json')
+    required = {'path', 'start_sample', 'stop_sample', 'sample_rate'}
+    if not required.issubset(windows.columns):
+        raise ValueError(f'Colunas em falta: {sorted(required - set(windows.columns))}')
+
+    # O alinhamento entre a ordem das linhas e a ordem das características é essencial.
+    keys = windows[['path', 'start_sample', 'stop_sample', 'sample_rate']].copy()
+    keys['path'] = keys['path'].map(lambda path: str(Path(path).resolve()))
+    digest = hashlib.sha256()
+    digest.update(pd.util.hash_pandas_object(keys, index=False).to_numpy().tobytes())
+    digest.update(np.asarray(mean, dtype='float32').tobytes())
+    digest.update(np.asarray(std, dtype='float32').tobytes())
+    digest.update(json.dumps(options, sort_keys=True).encode('utf-8'))
+    signature = digest.hexdigest()
+
+    if cache_path.is_file() and meta_path.is_file():
+        try:
+            metadata = json.loads(meta_path.read_text(encoding='utf-8'))
+            if metadata.get('signature') == signature:
+                cached = np.load(cache_path, mmap_mode='r', allow_pickle=False)
+                if cached.shape[0] == len(windows) and cached.dtype == np.float16:
+                    print(f'Características reutilizadas: {cache_path}')
+                    return cached
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            pass  # Reconstrói a cache se estiver corrompida ou desatualizada.
+
+    temporary_path = cache_path.with_name(cache_path.stem + '.tmp.npy')
+    stored = None
+    try:
+        for index, (_, row) in enumerate(windows.iterrows()):
+            logmel = extract_logmel_window(row, **options)
+            normalized = normalize_logmel(logmel, mean, std)
+            if stored is None:
+                stored = np.lib.format.open_memmap(
+                    str(temporary_path), mode='w+', dtype='float16',
+                    shape=(len(windows), *normalized.shape),
+                )
+            if normalized.shape != stored.shape[1:]:
+                raise ValueError('Foram obtidos espectrogramas com dimensões inconsistentes.')
+            stored[index] = normalized.astype('float16')
+            if progress_every and (index + 1) % progress_every == 0:
+                print(f'Características: {index + 1}/{len(windows)} janelas')
+        stored.flush()
+        del stored
+        stored = None
+        temporary_path.replace(cache_path)
+        meta_path.write_text(json.dumps({
+            'signature': signature, 'n_windows': len(windows),
+            'feature_options': options, 'dtype': 'float16',
+        }, indent=2, ensure_ascii=False), encoding='utf-8')
+    finally:
+        if stored is not None:
+            del stored
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+    print(f'Características guardadas: {cache_path}')
+    return np.load(cache_path, mmap_mode='r', allow_pickle=False)
+
+
+def aggregate_patient_predictions(windows, probabilities, patients):
+    """Obtém uma previsão por paciente através de médias hierárquicas.
+
+    Primeiro calcula a média das probabilidades das janelas de cada gravação;
+    depois, a média das gravações do mesmo paciente. Isto evita favorecer
+    gravações mais longas e pacientes com mais gravações.
+    """
+    scores = np.asarray(probabilities, dtype='float64')
+    if scores.ndim != 2 or scores.shape != (len(windows), len(CLASSES)):
+        raise ValueError('As probabilidades devem ter uma linha por janela e três classes.')
+    if not np.isfinite(scores).all() or (scores < 0).any():
+        raise ValueError('As probabilidades contêm valores inválidos.')
+    if not np.allclose(scores.sum(axis=1), 1.0, atol=1e-3):
+        raise ValueError('As probabilidades de cada janela devem somar 1.')
+    required = {'patient_id', 'filename'}
+    if not required.issubset(windows.columns) or not {'patient_id', 'murmur'}.issubset(patients.columns):
+        raise ValueError('Faltam identificadores de pacientes, gravações ou diagnósticos.')
+
+    probability_columns = [f'prob_{label}' for label in CLASSES]
+    indexed = windows[['patient_id', 'filename']].copy().reset_index(drop=True)
+    indexed[probability_columns] = scores
+    per_recording = indexed.groupby(['patient_id', 'filename'], sort=False)[probability_columns].mean()
+    per_patient = per_recording.groupby(level='patient_id', sort=False).mean().reset_index()
+
+    result = patients[['patient_id', 'murmur']].copy().reset_index(drop=True)
+    result = result.merge(per_patient, on='patient_id', how='left', validate='one_to_one')
+    if result[probability_columns].isna().any().any():
+        raise ValueError('Existem pacientes sem gravações ou previsões.')
+    result['prediction'] = np.asarray(CLASSES)[
+        result[probability_columns].to_numpy().argmax(axis=1)
+    ]
+    return result
