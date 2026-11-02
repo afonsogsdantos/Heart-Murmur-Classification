@@ -49,20 +49,20 @@ def audio_headers(paths):
 
 
 def plot_duration_distribution(audio_stats):
-    """Histograma das durações das gravações de treino."""
+    """Histograma descritivo das durações das gravações fornecidas."""
     fig, ax = plt.subplots(figsize=(8.5, 3.7))
     ax.hist(audio_stats["duration_s"], bins=30, edgecolor="white")
     ax.set(xlabel="Duração (s)", ylabel="Gravações",
-           title="Duração das gravações de treino")
+           title="Duração das gravações")
     fig.tight_layout()
     plt.show()
 
 
-def plot_recording_coverage(train_recordings):
-    per_patient = train_recordings.groupby("patient_id").size()
+def plot_recording_coverage(recordings):
+    per_patient = recordings.groupby("patient_id").size()
 
     locations = (
-        train_recordings["location"]
+        recordings["location"]
         .str.split("_").str[0]
         .value_counts()
         .sort_index()
