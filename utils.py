@@ -7,23 +7,7 @@ import numpy as np
 import pandas as pd
 import soundfile as sf
 
-
 CLASSES = ("Present", "Unknown", "Absent")
-METRIC_WEIGHTS = {"Present": 5.0, "Unknown": 3.0, "Absent": 1.0}
-
-
-def weighted_accuracy(y_true, y_pred):
-    """Weighted accuracy, aplicada a uma previsão por paciente."""
-    truth = np.asarray(y_true, dtype=str)
-    prediction = np.asarray(y_pred, dtype=str)
-
-    if truth.ndim != 1 or prediction.ndim != 1 or len(truth) == 0 or len(truth) != len(prediction):
-        raise ValueError("Os vetores de rótulos devem ser unidimensionais, não vazios e do mesmo tamanho.")
-    if not set(truth).issubset(METRIC_WEIGHTS) or not set(prediction).issubset(METRIC_WEIGHTS):
-        raise ValueError("Os rótulos devem pertencer às classes Present, Unknown e Absent.")
-
-    weights = np.array([METRIC_WEIGHTS[label] for label in truth], dtype=float)
-    return float(np.sum(weights * (truth == prediction)) / np.sum(weights))
 
 
 def plot_class_distribution(patients):
@@ -105,70 +89,6 @@ def plot_recording_coverage(train_recordings):
     fig.tight_layout()
     plt.show()
 
-
-def choose_examples(train_recordings, n_per_class=1, seed=42):
-    """Seleciona gravações de pacientes distintos, uma amostra por classe."""
-    rng = np.random.default_rng(seed)
-    selected = []
-    for label in CLASSES:
-        subset = train_recordings.loc[train_recordings["murmur"] == label]
-        patient_ids = subset["patient_id"].drop_duplicates().to_numpy()
-        if len(patient_ids) < n_per_class:
-            raise ValueError(f"Pacientes insuficientes para a classe {label}.")
-        chosen_patients = rng.choice(patient_ids, size=n_per_class, replace=False)
-        for patient_id in chosen_patients:
-            patient_audio = subset.loc[subset["patient_id"] == patient_id]
-            selected.append(patient_audio.iloc[int(rng.integers(len(patient_audio)))])
-    return pd.DataFrame(selected).reset_index(drop=True)
-
-
-def read_audio_excerpt(path, seconds=8):
-    """Carrega apenas os primeiros segundos de uma gravação."""
-    if seconds <= 0:
-        raise ValueError("A duração do excerto deve ser positiva.")
-    info = sf.info(str(path))
-    frames = min(info.frames, int(seconds * info.samplerate))
-    signal, sr = sf.read(str(path), frames=frames, dtype="float32")
-    if signal.ndim == 2:
-        signal = signal.mean(axis=1)
-    return signal, sr
-
-
-def plot_signal_and_mel(examples, seconds=8, n_fft=512, hop_length=128, n_mels=64):
-    """Forma de onda e mel-espectrograma de cada excerto selecionado."""
-    if examples.empty:
-        raise ValueError("Não foram fornecidas gravações.")
-
-    fig, axes = plt.subplots(
-        len(examples), 2, figsize=(11.5, 2.75 * len(examples)),
-        squeeze=False, constrained_layout=True,
-    )
-    color_image = None
-    for i, row in enumerate(examples.itertuples(index=False)):
-        signal, sr = read_audio_excerpt(row.path, seconds=seconds)
-        if len(signal) == 0:
-            raise ValueError(f"Gravação sem amostras: {row.filename}")
-        t = np.arange(len(signal)) / sr
-        axes[i, 0].plot(t, signal, linewidth=0.6)
-        axes[i, 0].set(title=f"{row.murmur} — {row.filename}",
-                       xlabel="Tempo (s)", ylabel="Amplitude")
-
-        mel = librosa.feature.melspectrogram(
-            y=signal, sr=sr, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels
-        )
-        mel_db = librosa.power_to_db(mel, ref=np.max, top_db=80)
-        color_image = librosa.display.specshow(
-            mel_db, sr=sr, hop_length=hop_length,
-            x_axis="time", y_axis="mel", vmin=-80, vmax=0, ax=axes[i, 1],
-        )
-        axes[i, 1].set(title="Mel-espectrograma (dB relativos)",
-                       xlabel="Tempo (s)", ylabel="Frequência (Hz)")
-
-    fig.colorbar(color_image, ax=axes[:, 1], shrink=0.8, label="dB")
-    plt.show()
-
-
-# --- Preparação das gravações para os modelos ---
 
 def build_window_manifest(recordings, window_seconds=4.0, stride_seconds=2.0, sample_rate=4000):
     """Indexa janelas com sobreposição, sem carregar todos os áudios para memória.
@@ -264,14 +184,6 @@ def extract_logmel_window(window, *, window_seconds=4.0, sample_rate=4000,
     return features
 
 
-def format_model_inputs(logmel):
-    """Organiza o mesmo espectrograma para a CNN 2D e para a LSTM."""
-    x = np.asarray(logmel, dtype='float32')
-    if x.ndim != 2:
-        raise ValueError('O log-mel deve ter dimensão (frequências, tempo).')
-    return x[..., np.newaxis], x.T.copy()
-
-
 def plot_logmel_window(logmel, *, sample_rate=4000, hop_length=128, fmin=20, fmax=1500):
     """Ilustração de uma janela transformada, diferente da exploração de áudios inteiros."""
     fig, ax = plt.subplots(figsize=(9, 3.2))
@@ -320,7 +232,19 @@ def normalize_logmel(logmel, mean, std):
     s = np.asarray(std, dtype='float32').reshape(-1, 1)
     if features.ndim != 2 or m.shape[0] != features.shape[0] or s.shape[0] != features.shape[0]:
         raise ValueError('A normalização deve ter uma estatística por banda mel.')
+    if not (np.isfinite(features).all() and np.isfinite(m).all() and np.isfinite(s).all()):
+        raise ValueError('A normalização recebeu valores não finitos.')
+    if (s <= 0).any():
+        raise ValueError('O desvio-padrão deve ser positivo em todas as bandas.')
     return ((features - m) / np.maximum(s, 1e-6)).astype('float32')
+
+
+def format_model_inputs(logmel):
+    """Organiza o mesmo espectrograma para a CNN 2D e para a LSTM."""
+    x = np.asarray(logmel, dtype='float32')
+    if x.ndim != 2:
+        raise ValueError('O log-mel deve ter dimensão (frequências, tempo).')
+    return x[..., np.newaxis], x.T.copy()
 
 
 def prepare_window_inputs(window, mean, std, feature_kwargs=None):
@@ -333,151 +257,3 @@ def prepare_window_inputs(window, mean, std, feature_kwargs=None):
     normalized = normalize_logmel(features, mean, std)
     return format_model_inputs(normalized)
 
-
-# --- Funções partilhadas pelo treino e pela avaliação das redes ---
-
-def balanced_window_weights(train_windows):
-    """Pondera as janelas, equilibrando classes, pacientes e gravações.
-
-    Cada classe tem o mesmo peso total; dentro de uma classe, cada paciente
-    contribui de forma igual e cada gravação do paciente tem o mesmo peso.
-    Assim, gravações longas não dominam a função de perda só por criarem
-    um maior número de janelas.
-    """
-    if train_windows.empty:
-        raise ValueError('Não há janelas de treino para ponderar.')
-    required = {'patient_id', 'filename', 'murmur'}
-    if not required.issubset(train_windows.columns):
-        raise ValueError(f'Colunas em falta: {sorted(required - set(train_windows.columns))}')
-    patient_labels = train_windows[['patient_id', 'murmur']].drop_duplicates()
-    if patient_labels['patient_id'].duplicated().any():
-        raise ValueError('Foram encontrados diagnósticos inconsistentes para um paciente.')
-
-    n_patients_class = patient_labels.groupby('murmur')['patient_id'].nunique()
-    n_recordings_patient = (
-        train_windows[['patient_id', 'filename']].drop_duplicates()
-        .groupby('patient_id').size()
-    )
-    n_windows_recording = train_windows.groupby(['patient_id', 'filename'])['filename'].transform('size')
-
-    weights = (
-        1.0 / train_windows['murmur'].map(n_patients_class).to_numpy(dtype='float64')
-        / train_windows['patient_id'].map(n_recordings_patient).to_numpy(dtype='float64')
-        / n_windows_recording.to_numpy(dtype='float64')
-    )
-    if not np.isfinite(weights).all() or (weights <= 0).any():
-        raise ValueError('Não foi possível calcular pesos de treino válidos.')
-    weights /= weights.mean()  # Peso médio igual a 1 para estabilidade da otimização.
-    return weights.astype('float32')
-
-
-def cache_normalized_logmel(windows, mean, std, cache_path, feature_kwargs=None, progress_every=2000):
-    """Guarda log-mel-espectrogramas normalizados em disco, sem os manter em RAM.
-
-    O ficheiro NPY utiliza float16 apenas para reduzir o espaço ocupado em disco;
-    os lotes são convertidos para float32 antes de entrarem nas redes. A assinatura
-    da cache inclui as janelas, os parâmetros de extração e a normalização, para
-    impedir a reutilização acidental de características desatualizadas.
-    """
-    import hashlib
-    import json
-
-    if windows.empty:
-        raise ValueError('Não há janelas para processar.')
-    options = dict(feature_kwargs or {})
-    cache_path = Path(cache_path)
-    if cache_path.suffix != '.npy':
-        raise ValueError('O ficheiro de cache deve ter a extensão .npy.')
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    meta_path = cache_path.with_suffix('.json')
-    required = {'path', 'start_sample', 'stop_sample', 'sample_rate'}
-    if not required.issubset(windows.columns):
-        raise ValueError(f'Colunas em falta: {sorted(required - set(windows.columns))}')
-
-    # O alinhamento entre a ordem das linhas e a ordem das características é essencial.
-    keys = windows[['path', 'start_sample', 'stop_sample', 'sample_rate']].copy()
-    keys['path'] = keys['path'].map(lambda path: str(Path(path).resolve()))
-    digest = hashlib.sha256()
-    digest.update(pd.util.hash_pandas_object(keys, index=False).to_numpy().tobytes())
-    digest.update(np.asarray(mean, dtype='float32').tobytes())
-    digest.update(np.asarray(std, dtype='float32').tobytes())
-    digest.update(json.dumps(options, sort_keys=True).encode('utf-8'))
-    signature = digest.hexdigest()
-
-    if cache_path.is_file() and meta_path.is_file():
-        try:
-            metadata = json.loads(meta_path.read_text(encoding='utf-8'))
-            if metadata.get('signature') == signature:
-                cached = np.load(cache_path, mmap_mode='r', allow_pickle=False)
-                if cached.shape[0] == len(windows) and cached.dtype == np.float16:
-                    print(f'Características reutilizadas: {cache_path}')
-                    return cached
-        except (OSError, ValueError, KeyError, json.JSONDecodeError):
-            pass  # Reconstrói a cache se estiver corrompida ou desatualizada.
-
-    temporary_path = cache_path.with_name(cache_path.stem + '.tmp.npy')
-    stored = None
-    try:
-        for index, (_, row) in enumerate(windows.iterrows()):
-            logmel = extract_logmel_window(row, **options)
-            normalized = normalize_logmel(logmel, mean, std)
-            if stored is None:
-                stored = np.lib.format.open_memmap(
-                    str(temporary_path), mode='w+', dtype='float16',
-                    shape=(len(windows), *normalized.shape),
-                )
-            if normalized.shape != stored.shape[1:]:
-                raise ValueError('Foram obtidos espectrogramas com dimensões inconsistentes.')
-            stored[index] = normalized.astype('float16')
-            if progress_every and (index + 1) % progress_every == 0:
-                print(f'Características: {index + 1}/{len(windows)} janelas')
-        stored.flush()
-        del stored
-        stored = None
-        temporary_path.replace(cache_path)
-        meta_path.write_text(json.dumps({
-            'signature': signature, 'n_windows': len(windows),
-            'feature_options': options, 'dtype': 'float16',
-        }, indent=2, ensure_ascii=False), encoding='utf-8')
-    finally:
-        if stored is not None:
-            del stored
-        if temporary_path.exists():
-            temporary_path.unlink()
-
-    print(f'Características guardadas: {cache_path}')
-    return np.load(cache_path, mmap_mode='r', allow_pickle=False)
-
-
-def aggregate_patient_predictions(windows, probabilities, patients):
-    """Obtém uma previsão por paciente através de médias hierárquicas.
-
-    Primeiro calcula a média das probabilidades das janelas de cada gravação;
-    depois, a média das gravações do mesmo paciente. Isto evita favorecer
-    gravações mais longas e pacientes com mais gravações.
-    """
-    scores = np.asarray(probabilities, dtype='float64')
-    if scores.ndim != 2 or scores.shape != (len(windows), len(CLASSES)):
-        raise ValueError('As probabilidades devem ter uma linha por janela e três classes.')
-    if not np.isfinite(scores).all() or (scores < 0).any():
-        raise ValueError('As probabilidades contêm valores inválidos.')
-    if not np.allclose(scores.sum(axis=1), 1.0, atol=1e-3):
-        raise ValueError('As probabilidades de cada janela devem somar 1.')
-    required = {'patient_id', 'filename'}
-    if not required.issubset(windows.columns) or not {'patient_id', 'murmur'}.issubset(patients.columns):
-        raise ValueError('Faltam identificadores de pacientes, gravações ou diagnósticos.')
-
-    probability_columns = [f'prob_{label}' for label in CLASSES]
-    indexed = windows[['patient_id', 'filename']].copy().reset_index(drop=True)
-    indexed[probability_columns] = scores
-    per_recording = indexed.groupby(['patient_id', 'filename'], sort=False)[probability_columns].mean()
-    per_patient = per_recording.groupby(level='patient_id', sort=False).mean().reset_index()
-
-    result = patients[['patient_id', 'murmur']].copy().reset_index(drop=True)
-    result = result.merge(per_patient, on='patient_id', how='left', validate='one_to_one')
-    if result[probability_columns].isna().any().any():
-        raise ValueError('Existem pacientes sem gravações ou previsões.')
-    result['prediction'] = np.asarray(CLASSES)[
-        result[probability_columns].to_numpy().argmax(axis=1)
-    ]
-    return result
