@@ -201,7 +201,6 @@ def fit_logmel_normalizer(train_windows, feature_kwargs=None, progress_every=0):
     """Calcula médias e desvios-padrão por banda mel, APENAS nas janelas de treino.
 
     Usa somas acumuladas para não manter todos os espectrogramas em memória.
-    Ajustar novamente em cada partição de treino, se for usada validação cruzada.
     O progresso pode ser apresentado de progress_every em progress_every janelas.
     """
     if train_windows.empty:
@@ -257,3 +256,104 @@ def prepare_window_inputs(window, mean, std, feature_kwargs=None):
     normalized = normalize_logmel(features, mean, std)
     return format_model_inputs(normalized)
 
+
+
+# ------------------------------------------------------------
+# Visualizações utilizadas no notebook; não alteram os sinais nem
+# as características fornecidas aos modelos.
+# ------------------------------------------------------------
+
+def plot_duration_by_class(audio_stats):
+    """Compara a duração dos ficheiros WAV por rótulo do paciente."""
+    required = {'murmur', 'duration_s'}
+    if not required.issubset(audio_stats.columns):
+        raise ValueError(f'Colunas em falta: {sorted(required - set(audio_stats.columns))}')
+    durations = [
+        audio_stats.loc[audio_stats['murmur'] == label, 'duration_s'].dropna().to_numpy()
+        for label in CLASSES
+    ]
+    if any(len(v) == 0 for v in durations):
+        raise ValueError('Pelo menos uma classe não contém durações válidas.')
+
+    fig, ax = plt.subplots(figsize=(9, 3.7))
+    ax.boxplot(durations, tick_labels=CLASSES, vert=False,
+               patch_artist=True, showfliers=False)
+    ax.set(xlabel='Duração de cada gravação (s)',
+           ylabel='Diagnóstico do paciente',
+           title='Distribuição da duração das gravações por classe')
+    ax.grid(axis='x', alpha=0.22)
+    fig.tight_layout()
+    plt.show()
+
+
+def plot_window_segmentation(recording_windows, *, sample_rate=4000, max_windows=4):
+    """Ilustra as primeiras janelas e a forma de onda de um único áudio de treino."""
+    if recording_windows.empty:
+        raise ValueError('É necessário fornecer janelas de uma gravação.')
+    if recording_windows['filename'].nunique() != 1:
+        raise ValueError('As janelas mostradas devem pertencer à mesma gravação.')
+    if max_windows < 1:
+        raise ValueError('max_windows deve ser positivo.')
+
+    windows = recording_windows.sort_values('window_index').head(max_windows)
+    path = Path(windows.iloc[0]['path'])
+    last_visible = float(windows['stop_s'].max())
+    with sf.SoundFile(str(path)) as source:
+        if source.samplerate != sample_rate:
+            raise ValueError('Frequência de amostragem inesperada.')
+        n_frames = min(source.frames, int(np.ceil(last_visible * sample_rate)))
+        audio = source.read(frames=n_frames, dtype='float32', always_2d=True).mean(axis=1)
+    time_s = np.arange(len(audio)) / sample_rate
+
+    fig, (ax_wave, ax_windows) = plt.subplots(
+        2, 1, figsize=(11, 5), sharex=True,
+        gridspec_kw={'height_ratios': [2.3, 1.5]},
+    )
+    ax_wave.plot(time_s, audio, linewidth=0.55)
+    ax_wave.set(ylabel='Amplitude',
+                title=f'Segmentação temporal — {path.name} (exemplo de treino)')
+    ax_wave.grid(axis='x', alpha=0.18)
+
+    for position, row in enumerate(windows.itertuples(index=False)):
+        start = float(row.start_s)
+        duration = float(row.stop_s) - start
+        color = f'C{position % 10}'
+        ax_windows.broken_barh([(start, duration)],
+                               (position - 0.35, 0.7), facecolors=color, alpha=0.75)
+        ax_windows.text(start + duration/2, position,
+                        f'Janela {int(row.window_index) + 1}',
+                        va='center', ha='center', color='white', weight='bold', fontsize=9)
+    ax_windows.set_yticks(range(len(windows)))
+    ax_windows.set_yticklabels([f'{int(x) + 1}' for x in windows['window_index']])
+    ax_windows.set(ylabel='Índice da janela', xlabel='Tempo (s)')
+    ax_windows.set_xlim(0, max(last_visible, 0.001))
+    ax_windows.set_ylim(-0.6, len(windows) - 0.4)
+    ax_windows.invert_yaxis()
+    fig.tight_layout()
+    plt.show()
+
+
+def plot_logmel_normalization_comparison(raw_logmel, normalized_logmel, *,
+                                         sample_rate=4000, hop_length=128,
+                                         fmin=20, fmax=1500):
+    """Compara a mesma janela em dB e após normalização por banda mel."""
+    raw = np.asarray(raw_logmel)
+    normalized = np.asarray(normalized_logmel)
+    if raw.ndim != 2 or raw.shape != normalized.shape:
+        raise ValueError('As matrizes devem ter a mesma forma (bandas, instantes).')
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.2), layout="constrained")
+    images = []
+    for ax, values, title in zip(
+        axes, (raw, normalized),
+        ('Antes da normalização — energia em dB',
+         'Depois da normalização — z-score por banda'),
+    ):
+        images.append(librosa.display.specshow(
+            values, sr=sample_rate, hop_length=hop_length,
+            x_axis='time', y_axis='mel', fmin=fmin, fmax=fmax, ax=ax,
+        ))
+        ax.set(title=title, xlabel='Tempo (s)', ylabel='Frequência (Hz)')
+    fig.colorbar(images[0], ax=axes[0], label='Energia (dB)', shrink=0.85)
+    fig.colorbar(images[1], ax=axes[1], label='Valor padronizado (z-score)', shrink=0.85)
+    fig.suptitle('A mesma janela antes e depois da normalização')
+    plt.show()
